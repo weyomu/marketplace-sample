@@ -1,0 +1,262 @@
+name: Build __SERVICE_NAME__ VM Image
+
+on:
+  push:
+    tags:
+      - "__SERVICE_NAME__-v*"
+  workflow_dispatch:
+    inputs:
+      image_version:
+        description: "Image version (major.minor.patch, e.g. 1.0.0)"
+        required: true
+        default: "1.0.0"
+      dry_run:
+        description: "Validate only, skip actual build"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-vm-image
+  cancel-in-progress: false
+
+env:
+  AZURE_LOCATION: "East US"
+  SIG_RESOURCE_GROUP: "rg-shared-images"
+  GALLERY_NAME: "MyGallery"
+  IMAGE_DEFINITION: "__IMAGE_DEFINITION__"
+  PACKER_DIR: "packer"
+
+jobs:
+  prepare:
+    name: Prepare Build Context
+    runs-on: ubuntu-latest
+    outputs:
+      image_version: ${{ steps.version.outputs.version }}
+      dry_run: ${{ steps.version.outputs.dry_run }}
+
+    steps:
+      - name: Extract image version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.image_version }}"
+            DRY_RUN="${{ github.event.inputs.dry_run }}"
+          else
+            TAG="${{ github.ref_name }}"
+            VERSION="${TAG#__SERVICE_NAME__-v}"
+            DRY_RUN="false"
+          fi
+
+          if ! echo "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Invalid version format: '${VERSION}'. Expected: major.minor.patch"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "dry_run=${DRY_RUN}" >> $GITHUB_OUTPUT
+          echo "Image version: ${VERSION}, dry_run: ${DRY_RUN}"
+
+  build:
+    name: Build VM Image with Packer
+    runs-on: ubuntu-latest
+    needs: prepare
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: "latest"
+
+      - name: Install Azure CLI
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          az --version
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Verify Azure SIG resources exist
+        run: |
+          az sig show \
+            --gallery-name "${{ env.GALLERY_NAME }}" \
+            --resource-group "${{ env.SIG_RESOURCE_GROUP }}" \
+            --output table
+          az sig image-definition show \
+            --gallery-name "${{ env.GALLERY_NAME }}" \
+            --gallery-image-definition "${{ env.IMAGE_DEFINITION }}" \
+            --resource-group "${{ env.SIG_RESOURCE_GROUP }}" \
+            --output table
+
+      - name: Ensure Packer build resource group exists
+        run: |
+          if ! az group show --name "rg-packer-build" &>/dev/null; then
+            az group create --name "rg-packer-build" --location "${{ env.AZURE_LOCATION }}"
+          else
+            echo "Resource group rg-packer-build already exists"
+          fi
+
+      - name: Initialize Packer plugins
+        working-directory: ${{ env.PACKER_DIR }}
+        run: packer init .
+
+      - name: Validate Packer template
+        working-directory: ${{ env.PACKER_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          packer validate \
+            -var "image_version=${{ needs.prepare.outputs.image_version }}" \
+            __SERVICE_NAME__.pkr.hcl
+
+      - name: Ensure managed image resource group exists
+        run: |
+          if ! az group show --name "rg-image-builders" &>/dev/null; then
+            az group create --name "rg-image-builders" --location "${{ env.AZURE_LOCATION }}"
+          else
+            echo "rg-image-builders already exists"
+          fi
+
+      - name: Build VM image with Packer
+        if: needs.prepare.outputs.dry_run != 'true'
+        working-directory: ${{ env.PACKER_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          PACKER_NO_COLOR: "true"
+        run: |
+          packer build \
+            -force \
+            -var "image_version=${{ needs.prepare.outputs.image_version }}" \
+            __SERVICE_NAME__.pkr.hcl
+          echo "Packer build completed"
+
+      - name: Publish managed image to Shared Image Gallery
+        if: needs.prepare.outputs.dry_run != 'true'
+        run: |
+          MANAGED_IMAGE_ID=$(az image show \
+            --resource-group "rg-image-builders" \
+            --name "__SERVICE_NAME__-${{ needs.prepare.outputs.image_version }}" \
+            --query id --output tsv)
+          echo "Managed image ID: ${MANAGED_IMAGE_ID}"
+
+          az sig image-version create \
+            --gallery-name "${{ env.GALLERY_NAME }}" \
+            --gallery-image-definition "${{ env.IMAGE_DEFINITION }}" \
+            --gallery-image-version "${{ needs.prepare.outputs.image_version }}" \
+            --resource-group "${{ env.SIG_RESOURCE_GROUP }}" \
+            --managed-image "${MANAGED_IMAGE_ID}" \
+            --target-regions "${{ env.AZURE_LOCATION }}" \
+            --output table
+          echo "Image published to SIG successfully"
+
+      - name: Skip build (dry run mode)
+        if: needs.prepare.outputs.dry_run == 'true'
+        run: echo "Dry run mode - build skipped"
+
+      - name: Upload Packer manifest
+        if: needs.prepare.outputs.dry_run != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: packer-manifest-${{ needs.prepare.outputs.image_version }}
+          path: ${{ env.PACKER_DIR }}/packer-manifest.json
+          retention-days: 90
+
+  validate:
+    name: Validate Image
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    if: needs.prepare.outputs.dry_run != 'true'
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Create test resource group
+        run: |
+          az group create \
+            --name "rg-__SERVICE_NAME__-test-${{ github.run_id }}" \
+            --location "${{ env.AZURE_LOCATION }}"
+
+      - name: Deploy test VM from image
+        id: deploy_vm
+        run: |
+          IMAGE_ID="/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ env.SIG_RESOURCE_GROUP }}/providers/Microsoft.Compute/galleries/${{ env.GALLERY_NAME }}/images/${{ env.IMAGE_DEFINITION }}/versions/${{ needs.prepare.outputs.image_version }}"
+          az vm create \
+            --resource-group "rg-__SERVICE_NAME__-test-${{ github.run_id }}" \
+            --name "vm-__SERVICE_NAME__-test" \
+            --image "${IMAGE_ID}" \
+            --admin-username "azureuser" \
+            --generate-ssh-keys \
+            --size "Standard_DC2s_v3" \
+            --output json > vm_output.json
+          VM_IP=$(cat vm_output.json | jq -r '.publicIpAddress')
+          echo "vm_ip=${VM_IP}" >> $GITHUB_OUTPUT
+          echo "Test VM deployed at: ${VM_IP}"
+
+      - name: Wait for VM to boot
+        run: sleep 60
+
+      - name: Validate service
+        run: |
+          az vm run-command invoke \
+            --resource-group "rg-__SERVICE_NAME__-test-${{ github.run_id }}" \
+            --name "vm-__SERVICE_NAME__-test" \
+            --command-id RunShellScript \
+            --scripts "systemctl is-active __SERVICE_NAME__" \
+            --output json | jq -r '.value[0].message'
+
+      - name: Cleanup test VM
+        if: always()
+        run: |
+          az group delete \
+            --name "rg-__SERVICE_NAME__-test-${{ github.run_id }}" \
+            --yes \
+            --no-wait
+
+  notify:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: [prepare, build, validate]
+    if: always()
+
+    steps:
+      - name: Write job summary
+        run: |
+          if [ "${{ needs.validate.result }}" = "success" ]; then
+            STATUS="SUCCESS"
+          elif [ "${{ needs.prepare.outputs.dry_run }}" = "true" ]; then
+            STATUS="DRY RUN"
+          else
+            STATUS="FAILED"
+          fi
+          echo "## __SERVICE_NAME__ VM Image Build Result" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: ${STATUS}" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${{ needs.prepare.outputs.image_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Gallery: ${{ env.GALLERY_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Image Definition: ${{ env.IMAGE_DEFINITION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Triggered by: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
