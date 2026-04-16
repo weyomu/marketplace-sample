@@ -49,8 +49,25 @@ Analyze "Files detected" and choose EXACTLY ONE strategy:
 
 ### Strategy B: Node.js — Source Build
 - **Trigger**: `package.json` exists AND `pnpm-lock.yaml` or `yarn.lock` exists, OR project is not a published CLI
-- **Action**: `git clone --depth 1 <repoUrl> /opt/<serviceName>` → `pnpm install` (or `npm ci`) → `pnpm build`
-- **ExecStart variable**: `SVC_BIN="/usr/bin/node /opt/<serviceName>/dist/index.js"` (adjust entry file based on package.json main/scripts)
+- **Action**: `git clone --depth 1 <repoUrl> /opt/<serviceName>` → `pnpm install` (or `npm ci`) → `pnpm build` (NO `|| true`)
+- **Entry file detection** (REQUIRED after build — do NOT hardcode):
+  ```bash
+  if [ -f "/opt/<serviceName>/dist/index.js" ]; then
+    ENTRY_FILE="dist/index.js"
+  elif [ -f "/opt/<serviceName>/dist/index.mjs" ]; then
+    ENTRY_FILE="dist/index.mjs"
+  elif [ -f "/opt/<serviceName>/index.js" ]; then
+    ENTRY_FILE="index.js"
+  else
+    echo "ERROR: Cannot find entry file after build" && exit 1
+  fi
+  ```
+- **ExecStart in heredoc** (write args directly, do NOT use a compound SVC_BIN variable):
+  ```bash
+  NODE_BIN=$(which node)
+  # then inside << EOF heredoc:
+  ExecStart=${NODE_BIN} /opt/<serviceName>/${ENTRY_FILE}
+  ```
 
 ### Strategy C: Python — Source Build
 - **Trigger**: `requirements.txt` or `pyproject.toml` or `setup.py` exists
@@ -101,7 +118,7 @@ Section 2:  apt-get update + upgrade + base packages (always include: curl wget 
 Section 3:  Language runtime installation (Node.js/Python/Go/Rust/Java — based on Decision Matrix)
 Section 4:  Application installation (npm global install OR git clone + build — based on Decision Matrix)
 Section 5:  Create system user with useradd --system --create-home --home-dir /var/lib/<svc> --shell /bin/bash
-Section 6:  Create directories (/var/lib/<svc>, /var/log/<svc>, /opt/<svc>) + chown to service user
+Section 6:  Create directories (/var/lib/<svc>, /var/log/<svc>) + chown ALL three paths to service user: /var/lib/<svc>, /var/log/<svc>, /opt/<svc>
 Section 7:  Capture SVC_BIN variable, write systemd unit file with << EOF, systemctl daemon-reload, systemctl enable
 Section 8:  apt-get install -y walinuxagent + systemctl enable walinuxagent
 Section 9:  apt-get install -y ufw + ufw --force reset + deny incoming + allow outgoing + allow 22/tcp + ufw --force enable
@@ -125,7 +142,7 @@ if ! id "<serviceName>" &>/dev/null; then
 fi
 ```
 
-### Pattern: systemd unit file (substitute your values)
+### Pattern: systemd unit file — Strategy A (global binary)
 ```bash
 SVC_BIN=$(which <binary>)
 
@@ -153,6 +170,44 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/<serviceName> /var/log/<serviceName>
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable <serviceName>.service
+```
+
+### Pattern: systemd unit file — Strategy B (source build, node)
+```bash
+NODE_BIN=$(which node)
+# ENTRY_FILE is already detected above via if/elif checks
+
+cat > /etc/systemd/system/<serviceName>.service << EOF
+[Unit]
+Description=<Project Description>
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<serviceName>
+Group=<serviceName>
+WorkingDirectory=/opt/<serviceName>
+Environment="NODE_ENV=production"
+ExecStart=${NODE_BIN} /opt/<serviceName>/${ENTRY_FILE}
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=10s
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+StandardOutput=append:/var/log/<serviceName>/app.log
+StandardError=append:/var/log/<serviceName>/error.log
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/<serviceName> /var/log/<serviceName> /opt/<serviceName>
 
 [Install]
 WantedBy=multi-user.target
@@ -199,3 +254,9 @@ sysctl -p /etc/sysctl.d/99-<serviceName>.conf 2>/dev/null || true
 | `systemctl start` during image build | Only `systemctl enable` — never start |
 | ExecStart inside `<< 'EOF'` | Capture to variable first, then use `<< EOF` (unquoted) |
 | `$MAINPID` inside heredoc unescaped | Always write `\$MAINPID` inside heredoc |
+| `SVC_BIN="${NODE_BIN} /opt/app/entry.js"` then `ExecStart=${SVC_BIN}` | Write args directly in heredoc: `ExecStart=${NODE_BIN} /opt/app/entry.js` |
+| `pnpm build \|\| true` — silences build failures | Never suppress build errors; let `set -e` catch them |
+| Hardcoding entry file (e.g. `ENTRY_FILE="app.mjs"`) without verification | After build, detect the actual entry file with `if [ -f ... ]` checks and `exit 1` if not found |
+| `chown` omits `/opt/<serviceName>` | Always chown all three: `/var/lib/<svc>`, `/var/log/<svc>`, `/opt/<svc>` |
+| `ReadWritePaths` omits `/opt/<serviceName>` | For source-build projects, always add `/opt/<svc>` to ReadWritePaths |
+| `* soft nofile 65536` (wildcard user) | Use the actual service user: `<serviceName> soft nofile 65536` |
